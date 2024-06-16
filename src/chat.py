@@ -1,73 +1,107 @@
-from openai import OpenAI
-from openai.types.chat.chat_completion_message_tool_call import (
-    ChatCompletionMessageToolCall,
-)
-from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
-from openai.types.chat.chat_completion_user_message_param import (
-    ChatCompletionUserMessageParam,
-)
-from openai.types.chat.chat_completion_system_message_param import (
-    ChatCompletionSystemMessageParam,
-)
-from typing import Optional, Tuple, List
-from thread import Thread
-from config import Configs
+from langchain_core.messages import SystemMessage
+from langchain_openai import ChatOpenAI
+from langchain_core.pydantic_v1 import BaseModel
+import uuid, time
+from typing import List
+from langchain_core.messages import HumanMessage
 
-DEFAULT_SYSTEM_PROMPT = {"role": "system", "content": "You are a helpful assistant"}
+user_background = {"name": str, "age": int, "favorite_party": str}
 
+template = f"""Your job is to ask the user atleast 20 questions about their political views and determine who they should vote for.
 
-class ChatLLM:
-    def __init__(self, client: Optional[OpenAI] = None) -> None:
-        if client is None:
-            self.client = OpenAI()
-        else:
-            self.client = client
+You have to ask one question at a time. Only 1 question at a time.
+"""
 
-    def chat(
-        self,
-        messages: List[ChatCompletionMessageParam],
-        model: str = Configs.model,
-        **kwargs
-    ) -> Tuple[ChatCompletionMessageParam, List[ChatCompletionMessageToolCall]]:
-        response = self.client.chat.completions.create(
-            model=model, messages=messages, **kwargs
-        )
-        response_message = response.choices[0].message
+llm = ChatOpenAI(temperature=0)
 
-        return response_message
+def get_messages_info(messages):
+    return [SystemMessage(content=template)] + messages
 
 
-class ChatSession:
-    def __init__(
-        self,
-        llm: ChatLLM,
-        system_prompt: ChatCompletionSystemMessageParam = DEFAULT_SYSTEM_PROMPT,
-        default_model: str = Configs.model,
-    ) -> None:
-        self.llm = llm
-        if isinstance(system_prompt, str):
-            system_prompt = {"role": "system", "content": system_prompt}
-        self.thread = Thread(system_prompt)
-        self.default_model = default_model
+class PromptInstructions(BaseModel):
+    """Instructions on how to prompt the LLM."""
 
-    def chat(
-        self,
-        user_message: ChatCompletionUserMessageParam | str | None = None,
-        model: str = None,
-        **kwargs
-    ) -> Tuple[ChatCompletionMessageParam, List[ChatCompletionMessageToolCall]]:
+    objective: str
+    variables: List[str]
+    constraints: List[str]
+    requirements: List[str]
+    
+    
+llm_with_tool = llm.bind_tools([PromptInstructions])
+chain = get_messages_info | llm_with_tool
 
-        if model is None:
-            model = self.default_model
+def _is_tool_call(msg):
+    return hasattr(msg, "additional_kwargs") and "tool_calls" in msg.additional_kwargs
 
-        # If user_message is not None, append it to the thread else just chat with the current thread
-        if user_message:
-            if isinstance(user_message, str):
-                user_message = {"role": "user", "content": user_message}
 
-            self.thread.append(user_message)
+# New system prompt
+prompt_system = """Based on the following requirements:
 
-        response = self.llm.chat(self.thread.messages, model=model, **kwargs)
+{reqs}"""
 
-        self.thread.append(response)
-        return response
+
+def get_prompt_messages(messages):
+    tool_call = None
+    other_msgs = []
+    for m in messages:
+        if _is_tool_call(m):
+            tool_call = m.additional_kwargs["tool_calls"][0]["function"]["arguments"]
+        elif tool_call is not None:
+            other_msgs.append(m)
+    return [SystemMessage(content=prompt_system.format(reqs=tool_call))] + other_msgs
+
+prompt_gen_chain = get_prompt_messages | llm
+
+def get_state(messages):
+    if _is_tool_call(messages[-1]):
+        return "prompt"
+    elif not isinstance(messages[-1], HumanMessage):
+        return END
+    for m in messages:
+        if _is_tool_call(m):
+            return "prompt"
+    return "info"
+
+"""Graph Section"""
+
+from langgraph.graph import MessageGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+memory = SqliteSaver.from_conn_string(":memory:")
+
+nodes = {k: k for k in ["info", "prompt", END]}
+workflow = MessageGraph()
+workflow.add_node("info", chain)
+workflow.add_node("prompt", prompt_gen_chain)
+workflow.add_conditional_edges("info", get_state, nodes)
+workflow.add_conditional_edges("prompt", get_state, nodes)
+workflow.set_entry_point("info")
+graph = workflow.compile(checkpointer=memory)
+
+
+config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+def chatbot_conversation(user_input):
+    if user_input.lower() in {"q", "quit"}:
+        return "Byebye"
+    else:
+        response = []
+        for output in graph.stream([HumanMessage(content=user_input)], config=config):
+            if "__end__" in output:
+                continue
+            for key, value in output.items():
+                response.append(value.content)
+        
+        response_text = "\n---\n".join(response)
+        
+        return response_text
+    
+if __name__ == "__main__":
+    print("Welcome to the chatbot! Type 'quit' or 'q' to exit.")
+    while True:
+        user_input = input("You: ")
+        ##user_message = create_user_message(user_input)
+        response = chatbot_conversation(user_input=user_input)
+        print("Bot:", response)
+        if "goodbye" in response.lower():
+            #User.objects.filter(id=user_id).update(chat_status='Completed')
+            break

@@ -9,9 +9,11 @@ from llama_index.core import (
 )
 from llama_index.core.llama_pack.base import BaseLlamaPack
 from llama_index.llms.openai import OpenAI
-# from llama_index.readers.wikipedia import WikipediaReader
 import streamlit as st
 from streamlit_pills import pills
+# from llama_index.readers.wikipedia import WikipediaReader
+from llama_index.legacy.readers.wikipedia import WikipediaReader
+from src.streamlit_app import StreamlitChatPack
 
 # Create a new event loop
 loop = asyncio.new_event_loop()
@@ -145,4 +147,4 @@ def run(self, *args: Any, **kwargs: Any) -> Any:
 
 
 if __name__ == "__main__":
-    # StreamlitChatPack(run_from_main=True).run()
+    StreamlitChatPack(run_from_main=True).run()
